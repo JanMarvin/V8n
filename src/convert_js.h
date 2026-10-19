@@ -1,0 +1,611 @@
+#ifndef V8N_CONVERT_JS_H
+#define V8N_CONVERT_JS_H
+
+/* Converts a tree of nodes created from an R object into JavaScript values.
+ * Nodes are arrays [tag, ...]:
+ *   [0]                              NULL
+ *   [1, Int32Array, null, scalar]    logical
+ *   [2, Int32Array, null, scalar]    integer
+ *   [3, Float64Array, mask, scalar]  double, mask is a Uint8Array marking NA or null;
+ *                                    whole numbers may come as Int32Array instead
+ *   [4, Int32Array, levels, scalar]  character or factor, 1-based codes into levels
+ *   [5, Uint8Array]                  raw
+ *   [6, children, names]             list, names is null for unnamed lists
+ *   [7, columns, names, nrow]        data frame
+ *   [8, vector, dims]                matrix or array
+ *   [9, string]                      JSON text inserted as is
+ * NA is -2147483648 in integer, logical and code vectors.
+ * Options follow jsonlite::toJSON(): dataframe, matrix, na, null. */
+static const char* decode_js = R"JS(
+(function (root, options) {
+  "use strict";
+  const NA = -2147483648;
+  const opts = options || {};
+  const na = opts.na;
+  const dataframe = opts.dataframe || "rows";
+  const colmajor = opts.matrix === "columnmajor";
+  const null_value = opts.null === "null";
+
+  function missing(text) {
+    return na === "string" ? text : null;
+  }
+
+  function element(node, i) {
+    switch (node[0]) {
+      case 1: { const v = node[1][i]; return v === NA ? missing("NA") : v !== 0; }
+      case 2: { const v = node[1][i]; return v === NA ? missing("NA") : v; }
+      case 3: {
+        const m = node[2];
+        if (m !== null && m[i] === 1) return missing("NA");
+        const v = node[1][i];
+        if (na !== undefined && !isFinite(v)) return missing(v !== v ? "NaN" : (v > 0 ? "Inf" : "-Inf"));
+        return v;
+      }
+      case 4: { const v = node[1][i]; return v === NA ? missing("NA") : node[2][v - 1]; }
+    }
+    return null;
+  }
+
+  function vector(node) {
+    const n = node[1].length;
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = element(node, i);
+    return out;
+  }
+
+  function define(obj, key, value) {
+    if (key === "__proto__") {
+      Object.defineProperty(obj, key, {value: value, enumerable: true, writable: true, configurable: true});
+    } else {
+      obj[key] = value;
+    }
+  }
+
+  function array(node, dims) {
+    const k = dims.length;
+    const strides = new Array(k);
+    let stride = 1;
+    for (let d = 0; d < k; d++) {
+      strides[d] = stride;
+      stride *= dims[d];
+    }
+    function build(level, base) {
+      if (level === k) return element(node, base);
+      const d = colmajor ? k - 1 - level : level;
+      const out = new Array(dims[d]);
+      for (let i = 0; i < dims[d]; i++) out[i] = build(level + 1, base + i * strides[d]);
+      return out;
+    }
+    return build(0, 0);
+  }
+
+  function column_values(col, n) {
+    const tag = col[0];
+    if (tag >= 1 && tag <= 4) {
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) out[i] = element(col, i);
+      return out;
+    }
+    if (tag === 6) {
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) out[i] = decode(col[1][i]);
+      return out;
+    }
+    if (tag === 7 || tag === 8) return decode(col);
+    return new Array(n).fill(null);
+  }
+
+  function columns(names, cols, n) {
+    const out = {};
+    for (let j = 0; j < names.length; j++) {
+      const col = cols[j];
+      const tag = col[0];
+      define(out, names[j], (tag >= 1 && tag <= 4) ? vector(col) : decode(col));
+    }
+    return out;
+  }
+
+  function values(cols, n) {
+    const p = cols.length;
+    const vals = new Array(p);
+    for (let j = 0; j < p; j++) vals[j] = column_values(cols[j], n);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const row = new Array(p);
+      for (let j = 0; j < p; j++) row[j] = vals[j][i];
+      out[i] = row;
+    }
+    return out;
+  }
+
+  function rows(names, cols, n) {
+    const p = names.length;
+    if (na !== undefined) {
+      const vals = new Array(p);
+      for (let j = 0; j < p; j++) vals[j] = column_values(cols[j], n);
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const row = {};
+        for (let j = 0; j < p; j++) define(row, names[j], vals[j][i]);
+        out[i] = row;
+      }
+      return out;
+    }
+    const kinds = new Array(p);
+    const data = new Array(p);
+    const extra = new Array(p);
+    const has_na = new Array(p);
+    for (let j = 0; j < p; j++) {
+      const col = cols[j];
+      const tag = col[0];
+      if (tag >= 1 && tag <= 4) {
+        kinds[j] = tag;
+        data[j] = col[1];
+        extra[j] = col[2];
+        if (tag === 3) {
+          has_na[j] = col[2] !== null;
+        } else {
+          has_na[j] = col[1].indexOf(NA) !== -1;
+        }
+      } else {
+        kinds[j] = 6;
+        extra[j] = null;
+        has_na[j] = false;
+        data[j] = column_values(col, n);
+      }
+    }
+    const expr = new Array(p);
+    const checks = new Array(p);
+    let any_na = false;
+    for (let j = 0; j < p; j++) {
+      const c = "c" + j + "[i]";
+      switch (kinds[j]) {
+        case 1: expr[j] = "(" + c + " !== 0)"; checks[j] = c + " !== NA"; break;
+        case 2: expr[j] = c; checks[j] = c + " !== NA"; break;
+        case 3: expr[j] = c; checks[j] = "x" + j + "[i] === 0"; break;
+        case 4: expr[j] = "x" + j + "[" + c + " - 1]"; checks[j] = c + " !== NA"; break;
+        case 6: expr[j] = c; checks[j] = "true"; break;
+      }
+      if (has_na[j]) any_na = true;
+    }
+    const fields = new Array(p);
+    const na_checks = [];
+    for (let j = 0; j < p; j++) {
+      const key = JSON.stringify(names[j]);
+      fields[j] = (names[j] === "__proto__" ? "[" + key + "]" : key) + ": " + expr[j];
+      if (has_na[j]) na_checks.push(checks[j]);
+    }
+    let src = "\"use strict\";\nconst NA = -2147483648;\n";
+    for (let j = 0; j < p; j++)
+      src += "const c" + j + " = data[" + j + "], x" + j + " = extra[" + j + "];\n";
+    src += "const rows = new Array(n);\nfor (let i = 0; i < n; i++) {\n";
+    if (any_na) {
+      src += "if (" + na_checks.join(" && ") + ") {\nrows[i] = {" + fields.join(", ") + "};\ncontinue;\n}\n";
+      src += "const row = {};\n";
+      for (let j = 0; j < p; j++) {
+        const key = JSON.stringify(names[j]);
+        const store = (names[j] === "__proto__") ?
+          "Object.defineProperty(row, " + key + ", {value: " + expr[j] + ", enumerable: true, writable: true, configurable: true});" :
+          "row[" + key + "] = " + expr[j] + ";";
+        src += has_na[j] ? "if (" + checks[j] + ") " + store + "\n" : store + "\n";
+      }
+      src += "rows[i] = row;\n";
+    } else {
+      src += "rows[i] = {" + fields.join(", ") + "};\n";
+    }
+    src += "}\nreturn rows;\n";
+    return (new Function("data", "extra", "n", src))(data, extra, n);
+  }
+
+  function decode(node) {
+    switch (node[0]) {
+      case 0:
+        return null_value ? null : {};
+      case 1:
+      case 2:
+      case 3:
+      case 4:
+        return node[3] ? element(node, 0) : vector(node);
+      case 5:
+        return node[1];
+      case 6: {
+        const children = node[1];
+        const names = node[2];
+        const n = children.length;
+        if (names === null) {
+          const out = new Array(n);
+          for (let i = 0; i < n; i++) out[i] = decode(children[i]);
+          return out;
+        }
+        const out = {};
+        for (let i = 0; i < n; i++) define(out, names[i] === "" ? String(i + 1) : names[i], decode(children[i]));
+        return out;
+      }
+      case 7:
+        if (dataframe === "columns") return columns(node[2], node[1], node[3]);
+        if (dataframe === "values") return values(node[1], node[3]);
+        return rows(node[2], node[1], node[3]);
+      case 8:
+        return array(node[1], node[2]);
+      case 9:
+        return JSON.parse(node[1]);
+    }
+    throw new TypeError("Unknown node type " + node[0]);
+  }
+
+  return decode(root);
+})
+)JS";
+
+/* Converts a JavaScript value into the same kind of nodes, but with
+ * codes in character vectors starting at 1 and 0 meaning NA, and masks
+ * at position 2 for logical, integer and double vectors.
+ * Options follow jsonlite::fromJSON(): simplifyVector, simplifyDataFrame,
+ * simplifyMatrix. */
+static const char* encode_js = R"JS(
+(function (root, options) {
+  "use strict";
+  const opts = options || {};
+  const simplify_vector = opts.simplifyVector !== false;
+  const simplify_frame = (opts.simplifyDataFrame === undefined) ? simplify_vector : opts.simplifyDataFrame !== false;
+  const simplify_matrix = (opts.simplifyMatrix === undefined) ? simplify_vector : opts.simplifyMatrix !== false;
+  let depth = 0;
+
+  function resolve(v) {
+    if (v !== null && typeof v === "object" && typeof v.toJSON === "function") return v.toJSON();
+    return v;
+  }
+
+  function missing(v) {
+    return v === undefined || v === null || typeof v === "function" || typeof v === "symbol";
+  }
+
+  function enter() {
+    if (++depth > 1000) throw new RangeError("Maximum nesting depth exceeded (circular structure?)");
+  }
+
+  function special_number(s) {
+    return s === "NA" || s === "NaN" || s === "Inf" || s === "-Inf";
+  }
+
+  function vector(vals) {
+    const n = vals.length;
+    let has_str = false, has_num = false, has_bool = false, all_int = true, only_special = true, only_na = true;
+    for (let i = 0; i < n; i++) {
+      const v = vals[i];
+      switch (typeof v) {
+        case "number":
+          has_num = true;
+          if (all_int && !(Number.isInteger(v) && v > -2147483648 && v <= 2147483647)) all_int = false;
+          break;
+        case "bigint":
+          has_num = true;
+          all_int = false;
+          break;
+        case "boolean":
+          has_bool = true;
+          break;
+        case "string":
+          has_str = true;
+          if (only_special && !special_number(v)) only_special = false;
+          if (only_na && v !== "NA") only_na = false;
+          break;
+        case "object":
+          if (v !== null) return null;
+          break;
+      }
+    }
+    if (has_str && !(has_num && only_special)) {
+      const codes = new Int32Array(n);
+      const levels = [];
+      const index = new Map();
+      for (let i = 0; i < n; i++) {
+        let v = vals[i];
+        switch (typeof v) {
+          case "string": break;
+          case "number": case "bigint": v = String(v); break;
+          case "boolean": v = v ? "TRUE" : "FALSE"; break;
+          default: continue;
+        }
+        let code = index.get(v);
+        if (code === undefined) {
+          levels.push(v);
+          code = levels.length;
+          index.set(v, code);
+        }
+        codes[i] = code;
+      }
+      return [4, codes, levels];
+    }
+    if (has_num) {
+      let mask = null;
+      if (all_int && (!has_str || only_na)) {
+        const out = new Int32Array(n);
+        for (let i = 0; i < n; i++) {
+          const v = vals[i];
+          if (typeof v === "number") {
+            out[i] = v;
+          } else if (typeof v === "boolean") {
+            out[i] = v ? 1 : 0;
+          } else {
+            if (mask === null) mask = new Uint8Array(n);
+            mask[i] = 1;
+          }
+        }
+        return [2, out, mask];
+      }
+      const out = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const v = vals[i];
+        switch (typeof v) {
+          case "number": out[i] = v; break;
+          case "bigint": out[i] = Number(v); break;
+          case "boolean": out[i] = v ? 1 : 0; break;
+          case "string":
+            if (v === "NaN") { out[i] = NaN; break; }
+            if (v === "Inf") { out[i] = Infinity; break; }
+            if (v === "-Inf") { out[i] = -Infinity; break; }
+          default:
+            if (mask === null) mask = new Uint8Array(n);
+            mask[i] = 1;
+        }
+      }
+      return [3, out, mask];
+    }
+    const out = new Int32Array(n);
+    let mask = null;
+    for (let i = 0; i < n; i++) {
+      const v = vals[i];
+      if (typeof v === "boolean") {
+        out[i] = v ? 1 : 0;
+      } else {
+        if (mask === null) mask = new Uint8Array(n);
+        mask[i] = 1;
+      }
+    }
+    return [1, out, mask];
+  }
+
+  function classify(vals) {
+    const n = vals.length;
+    let objects = 0, arrays = 0, others = 0, nulls = 0, primitives = 0;
+    for (let i = 0; i < n; i++) {
+      const v = resolve(vals[i]);
+      vals[i] = v;
+      if (missing(v)) {
+        nulls++;
+      } else if (typeof v === "object") {
+        if (Array.isArray(v)) arrays++;
+        else if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) others++;
+        else objects++;
+      } else {
+        primitives++;
+      }
+    }
+    return {objects: objects, arrays: arrays, others: others, nulls: nulls, primitives: primitives};
+  }
+
+  function column(rows, key) {
+    const n = rows.length;
+    if (key === "__proto__") {
+      const vals = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const r = rows[i];
+        vals[i] = (r !== null && Object.prototype.hasOwnProperty.call(r, key)) ? r[key] : undefined;
+      }
+      return vals;
+    }
+    const src = "\"use strict\";\nconst n = rows.length;\nconst vals = new Array(n);\n" +
+      "for (let i = 0; i < n; i++) {\nconst r = rows[i];\nvals[i] = (r === null) ? undefined : r[" +
+      JSON.stringify(key) + "];\n}\nreturn vals;";
+    return (new Function("rows", src))(rows);
+  }
+
+  function scan_columns(rows, keys) {
+    const p = keys.length;
+    let src = "\"use strict\";\nconst n = rows.length;\n";
+    for (let j = 0; j < p; j++)
+      src += "const f" + j + " = new Float64Array(n); let s" + j + " = null, l" + j + " = null, h" + j + " = null, m" + j + " = null, b" + j + " = 0, x" + j + " = false;\n";
+    src += "for (let i = 0; i < n; i++) {\nconst r = rows[i];\nlet v;\n";
+    src += "if (r === null) {\n";
+    for (let j = 0; j < p; j++)
+      src += "if (m" + j + " === null) m" + j + " = new Uint8Array(n); m" + j + "[i] = 1;\n";
+    src += "continue;\n}\n";
+    for (let j = 0; j < p; j++) {
+      if (keys[j] === "__proto__") continue;
+      src += "v = r[" + JSON.stringify(keys[j]) + "];\n" +
+        "if (typeof v === \"number\") { f" + j + "[i] = v; b" + j + " |= 1; if (!x" + j + " && (v !== (v | 0) || v === -2147483648)) x" + j + " = true; }\n" +
+        "else if (v === undefined || v === null) { if (m" + j + " === null) m" + j + " = new Uint8Array(n); m" + j + "[i] = 1; }\n" +
+        "else if (typeof v === \"string\") { if (s" + j + " === null) { s" + j + " = new Int32Array(n); l" + j + " = []; h" + j + " = new Map(); } " +
+        "let c = h" + j + ".get(v); if (c === undefined) { l" + j + ".push(v); c = l" + j + ".length; h" + j + ".set(v, c); } s" + j + "[i] = c; b" + j + " |= 4; }\n" +
+        "else if (typeof v === \"boolean\") { f" + j + "[i] = v ? 1 : 0; b" + j + " |= 2; }\n" +
+        "else b" + j + " |= 8;\n";
+    }
+    src += "}\nreturn [";
+    for (let j = 0; j < p; j++) {
+      src += (j ? ", " : "") + ((keys[j] === "__proto__") ? "null" : "[f" + j + ", s" + j + ", m" + j + ", b" + j + ", x" + j + ", l" + j + "]");
+    }
+    src += "];\n";
+    const states = (new Function("rows", src))(rows);
+    const n = rows.length;
+    const out = new Array(p);
+    for (let j = 0; j < p; j++) {
+      const st = states[j];
+      if (st === null || (st[3] & 8) !== 0 || ((st[3] & 4) !== 0 && (st[3] & 3) !== 0)) {
+        out[j] = null;
+        continue;
+      }
+      const f = st[0], mask = st[2], kind = st[3];
+      if (kind & 4) {
+        out[j] = [4, st[1], st[5]];
+      } else if (kind & 1) {
+        out[j] = st[4] ? [3, f, mask] : [2, Int32Array.from(f), mask];
+      } else {
+        out[j] = [1, Int32Array.from(f), mask];
+      }
+    }
+    return out;
+  }
+
+  function frame(vals) {
+    const n = vals.length;
+    const rows = new Array(n);
+    let keys = null;
+    let seen = null;
+    for (let i = 0; i < n; i++) {
+      const r = vals[i];
+      if (missing(r)) {
+        rows[i] = null;
+        continue;
+      }
+      rows[i] = r;
+      if (keys === null) {
+        keys = Object.keys(r);
+        seen = new Set(keys);
+        continue;
+      }
+      let j = 0;
+      let same = true;
+      for (const k in r) {
+        if (j >= keys.length || keys[j] !== k) {
+          same = false;
+          break;
+        }
+        j++;
+      }
+      if (same && j === keys.length) continue;
+      const rk = Object.keys(r);
+      for (let k = 0; k < rk.length; k++) {
+        if (!seen.has(rk[k])) {
+          seen.add(rk[k]);
+          keys.push(rk[k]);
+        }
+      }
+    }
+    if (keys === null) keys = [];
+    const p = keys.length;
+    const columns = new Array(p);
+    enter();
+    const fast = scan_columns(rows, keys);
+    for (let j = 0; j < p; j++) {
+      if (fast[j] !== null) {
+        columns[j] = fast[j];
+        continue;
+      }
+      const col = column(rows, keys[j]);
+      const vec = vector(col);
+      if (vec !== null) {
+        columns[j] = vec;
+        continue;
+      }
+      const c = classify(col);
+      if (c.objects + c.arrays + c.others === 0) {
+        columns[j] = vector(col);
+      } else if (c.objects > 0 && c.arrays + c.others + c.primitives === 0) {
+        columns[j] = frame(col);
+      } else {
+        const children = new Array(n);
+        for (let i = 0; i < n; i++) children[i] = encode(col[i]);
+        columns[j] = [6, children, null];
+      }
+    }
+    depth--;
+    return [7, columns, keys, n];
+  }
+
+  function dims_of(vals) {
+    const dims = [vals.length];
+    let level = vals;
+    while (level.length > 0 && Array.isArray(level[0])) {
+      dims.push(level[0].length);
+      level = level[0];
+    }
+    if (dims.length < 2) return null;
+    function check(v, d) {
+      if (d === dims.length) return !(v !== null && typeof v === "object") && typeof v !== "function";
+      if (!Array.isArray(v) || v.length !== dims[d]) return false;
+      for (let i = 0; i < v.length; i++) if (!check(v[i], d + 1)) return false;
+      return true;
+    }
+    for (let i = 0; i < vals.length; i++) if (!check(vals[i], 1)) return null;
+    return dims;
+  }
+
+  function matrix(vals, dims) {
+    let total = 1;
+    for (let d = 0; d < dims.length; d++) total *= dims[d];
+    const flat = new Array(total);
+    function fill(v, level, base, mult) {
+      if (level === dims.length) {
+        flat[base] = v;
+        return;
+      }
+      for (let i = 0; i < v.length; i++) fill(v[i], level + 1, base + i * mult, mult * dims[level]);
+    }
+    fill(vals, 0, 0, 1);
+    return [8, vector(flat), dims];
+  }
+
+  function list(vals) {
+    const n = vals.length;
+    const children = new Array(n);
+    for (let i = 0; i < n; i++) children[i] = encode(vals[i]);
+    return [6, children, null];
+  }
+
+  function encode_array(arr) {
+    const n = arr.length;
+    if (n === 0) return [6, [], null];
+    if (simplify_vector) {
+      const vec = vector(arr);
+      if (vec !== null) return vec;
+    }
+    enter();
+    const vals = arr.slice();
+    const c = classify(vals);
+    let out;
+    if (simplify_vector && c.objects + c.arrays + c.others === 0) {
+      out = vector(vals);
+    } else if (simplify_frame && c.objects > 0 && c.arrays + c.others + c.primitives === 0) {
+      out = frame(vals);
+    } else if (simplify_matrix && c.arrays === n) {
+      const dims = dims_of(vals);
+      out = (dims !== null && dims[dims.length - 1] > 0) ? matrix(vals, dims) : list(vals);
+    } else {
+      out = list(vals);
+    }
+    depth--;
+    return out;
+  }
+
+  function encode(value) {
+    const v = resolve(value);
+    if (missing(v)) return [0];
+    switch (typeof v) {
+      case "boolean": return [1, Int32Array.of(v ? 1 : 0), null];
+      case "number": return vector([v]);
+      case "bigint": return [3, Float64Array.of(Number(v)), null];
+      case "string": return [4, Int32Array.of(1), [v]];
+    }
+    if (v instanceof ArrayBuffer) return [5, new Uint8Array(v)];
+    if (ArrayBuffer.isView(v)) return [5, v];
+    if (Array.isArray(v)) return encode_array(v);
+    enter();
+    const keys = Object.keys(v);
+    const children = [];
+    const names = [];
+    for (let j = 0; j < keys.length; j++) {
+      const x = resolve(v[keys[j]]);
+      if (x === undefined || typeof x === "function" || typeof x === "symbol") continue;
+      names.push(keys[j]);
+      children.push(encode(x));
+    }
+    depth--;
+    return [6, children, names];
+  }
+
+  return encode(root);
+})
+)JS";
+
+#endif

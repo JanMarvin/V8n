@@ -1,0 +1,250 @@
+---
+title: "Introduction to V8n"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    fig_caption: false
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteIndexEntry{Introduction to V8n}
+  \usepackage[utf8]{inputenc} 
+---
+
+```{r, echo = FALSE, message = FALSE}
+knitr::opts_chunk$set(comment = "")
+library(V8n)
+```
+
+
+V8 is Google's open source, high performance JavaScript and WebAssembly engine. It is written in C++ and implements ECMAScript as specified in ECMA-262. The V8n R package builds on the C++ library to provide a completely standalone JavaScript engine within R:
+
+```{r}
+# Create a new context
+ct <- v8()
+
+# Evaluate some code
+ct$eval("var foo = 123")
+ct$eval("var bar = 456")
+ct$eval("foo + bar")
+```
+
+A major advantage over the other foreign language interfaces is that V8n requires no compilers, external executables or other run-time dependencies at run time, and works on all major platforms.
+
+```{r}
+# Create some JSON
+cat(ct$eval("JSON.stringify({x:Math.random()})"))
+
+# Simple closure
+ct$eval("(function(x){return x+1;})(123)")
+```
+
+However note that V8 by itself is just the naked JavaScript engine. There is no DOM (i.e. no *window* object), no network or disk IO, and no event loop beyond promises. Which is fine because we already have all of those in R. In this sense V8n resembles other foreign language interfaces such as Rcpp or rJava, but then for JavaScript.
+
+## Loading JavaScript Libraries
+
+The `ct$source` method is a convenience function for loading JavaScript libraries from a file or url.
+
+```{r}
+cdn <- "https://cdnjs.cloudflare.com/ajax/libs/"
+ct$source(paste0(cdn, "underscore.js/1.13.6/underscore-min.js"))
+ct$source(paste0(cdn, "crossfilter/1.3.11/crossfilter.min.js"))
+```
+
+## Data Interchange
+
+Values are converted between R and JavaScript using the bidirectional mapping described in [Ooms (2014)](https://arxiv.org/abs/1403.2805), the same mapping that the jsonlite package implements. The values are copied directly between R vectors and JavaScript arrays, without going through JSON text, so doubles keep their full precision.
+
+```{r}
+ct$assign("mydata", mtcars)
+ct$get("mydata")
+```
+
+The options of `jsonlite::toJSON()` and `jsonlite::fromJSON()` can be passed to `ct$assign()` and `ct$get()` to change the mapping:
+
+```{r}
+ct$assign("mydata", head(mtcars, 2), dataframe = "columns")
+ct$eval("JSON.stringify(mydata)")
+ct$get("mydata", simplifyVector = FALSE)$mpg
+```
+
+Alternatively use `JS()` to assign the value of a JavaScript expression (without converting it):
+
+```{r}
+ct$assign("foo", JS("function(x){return x*x}"))
+ct$assign("bar", JS("foo(9)"))
+ct$get("bar")
+```
+
+## Function Calls
+
+The `ct$call` method calls a JavaScript function, automatically converting objects (arguments and return value) between R and JavaScript:
+
+```{r}
+ct$call("_.filter", mtcars, JS("function(x){return x.mpg < 15}"))
+```
+
+It looks a bit like `.Call` but then for JavaScript instead of C.
+
+## Promises
+
+If a call to `ct$eval()`, `ct$get()`, or `ct$call()` returns a JavaScript promise, you can set `await = TRUE` to wait for the promise to be resolved. It will then return the result of the promise, or an error in case the promise is rejected.
+
+```{r error=TRUE}
+js <- 'function test_number(x){
+  var promise = new Promise(function(resolve, reject) {
+    if(x == 42)
+      resolve(true)
+    else
+      reject("This is wrong")
+  })
+  return promise;
+}'
+
+# Call will just show a promise
+ctx <- v8()
+ctx$eval(js)
+
+# A promise does not return anything in itself:
+ctx$call("test_number", 42)
+
+# Resolve the promise to the result
+ctx$call("test_number", 42, await = TRUE)
+
+# A rejected promise will throw an error
+ctx$call("test_number", 41, await = TRUE)
+```
+
+## warnings, errors and console.log
+
+Evaluating invalid JavaScript code results in a SyntaxError:
+
+```{r, error=TRUE, purl = FALSE}
+# A common typo
+ct$eval("var foo <- 123;")
+```
+
+JavaScript runtime exceptions are automatically propagated into R errors:
+
+```{r, error=TRUE, purl = FALSE}
+# Runtime errors
+ct$eval("123 + doesnotexit")
+```
+
+Within JavaScript we can also call back to the R console manually using `console.log`, `console.warn` and `console.error`. This allows for explicitly generating output, warnings or errors from within a JavaScript application.
+
+```{r, error = TRUE, purl = FALSE}
+ct$eval('console.log("this is a message")')
+ct$eval('console.warn("Heads up!")')
+ct$eval('console.error("Oh no! An error!")')
+```
+
+A example of using `console.error` is to verify that external resources were loaded:
+
+```{r, eval=FALSE}
+ct <- v8()
+ct$source(paste0(cdn, "crossfilter/1.3.11/crossfilter.min.js"))
+ct$eval('var cf = crossfilter || console.error("failed to load crossfilter!")')
+```
+
+## The Global Namespace
+
+Unlike what you might be used to from Node or your browser, the global namespace for a new context is very minimal. By default it contains only a few objects: `global` (a reference to itself), `console` (for `console.log` and friends) and `print` (an alias of console.log needed by some JavaScript libraries)
+
+```{r}
+ct <- v8()
+ct$get(JS("Object.keys(global)"))
+```
+
+A context always has a global scope, even when no name is set. When a context is initiated with `global = NULL`, it can still be reached by evaluating the `this` keyword within the global scope:
+
+```{r}
+ct2 <- v8(global = NULL, console = FALSE)
+ct2$get(JS("Object.keys(this).length"))
+ct2$assign("cars", cars)
+ct2$eval("var foo = 123")
+ct2$eval("function test(x){x+1}")
+ct2$get(JS("Object.keys(this).length"))
+ct2$get(JS("Object.keys(this)"))
+```
+
+To create your own global you could use something like:
+
+```{r}
+ct2$eval("var __global__ = this")
+ct2$eval("(function(){var bar = [1,2,3,4]; __global__.bar = bar; })()")
+ct2$get("bar")
+```
+
+## Syntax Validation
+
+V8n also allows for validating JavaScript syntax, without actually evaluating it.
+
+```{r}
+ct$validate("function foo(x){2*x}")
+ct$validate("foo = function(x){2*x}")
+```
+
+This might be useful for all those R libraries that generate browser graphics via templated JavaScript. Note that JavaScript does not allow for defining anonymous functions in the global scope:
+
+```{r}
+ct$validate("function(x){2*x}")
+```
+
+To check if an anonymous function is syntactically valid, prefix it with `!` or wrap in `()`. These are OK:
+```{r}
+ct$validate("(function(x){2*x})")
+ct$validate("!function(x){2*x}")
+```
+
+
+## Callback To R
+
+JavaScript code can interact with the R session using the `console.r` API. From JavaScript we can read/write R objects via `console.r.get` and `console.r.assign`. The final argument is an optional object with the same `toJSON` or `fromJSON` options as `ct$assign()` and `ct$get()`.
+
+```javascript
+// read the iris object into JS
+var iris = console.r.get("iris")
+var iris_col = console.r.get("iris", {dataframe : "columns"})
+
+//write an object back to the R session
+console.r.assign("iris2", iris)
+console.r.assign("iris3", iris, {simplifyVector : false})
+```
+
+To call R functions use `console.r.call`. The first argument should be a string which evaluates to a function. The second argument contains a list of arguments passed to the function, similar to `do.call` in R. Both named and unnamed lists are supported. The return object is converted to JavaScript in the same way.
+
+```javascript
+//calls rnorm(n=2, mean=10, sd=5)
+var out = console.r.call('rnorm', {n: 2,mean:10, sd:5})
+var out = console.r.call('rnorm', [2, 20, 5])
+
+//anonymous function
+var out = console.r.call('function(x){x^2}', {x:12})
+```
+
+There is also a `console.r.eval` function, which evaluates some code. It takes only a single argument (the string to evaluate) and does not return anything. Output is printed to the console.
+
+```javascript
+console.r.eval('sessionInfo()')
+```
+
+Besides automatically converting objects, V8n also propagates exceptions between R, C++ and JavaScript up and down the stack. Hence you can catch R errors as JavaScript exceptions when calling an R function from JavaScript or vice versa. If nothing gets caught, exceptions bubble all the way up as R errors in your top-level R session.
+
+```javascript
+//raise an error in R
+console.r.call('stop("ouch!")')
+
+//catch error from JavaScript
+try {
+  console.r.call('stop("ouch!")')
+} catch (e) {
+  console.log("Uhoh R had an error: " + e)
+}
+//# Uhoh R had an error: ouch!
+```
+

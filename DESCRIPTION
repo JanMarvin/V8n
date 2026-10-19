@@ -1,0 +1,36 @@
+Package: V8n
+Type: Package
+Title: Embedded JavaScript and WebAssembly Engine for R
+Version: 0.1.0
+Authors@R: c(
+    person("Jan Marvin", "Garbuszus", role = c("aut", "cre"),
+      email = "jan.garbuszus@ruhr-uni-bochum.de"),
+    person("Jeroen", "Ooms", role = c("aut", "cph"),
+      comment = c(ORCID = "0000-0002-4035-0289", note = "author of the V8 package")))
+Description: An R interface to V8 <https://v8.dev>: Google's open source
+    JavaScript and WebAssembly engine. A fork of the 'V8' package that copies
+    values directly between R vectors and JavaScript typed arrays instead of
+    converting them to JSON text.
+License: MIT + file LICENSE
+URL: https://github.com/JanMarvin/V8n
+BugReports: https://github.com/JanMarvin/V8n/issues
+SystemRequirements: V8 11.3 or newer: libnode-dev (Debian, Ubuntu) or v8-devel
+    (Fedora). On most other platforms a static libv8 is downloaded during the
+    installation, see the README for details.
+NeedsCompilation: yes
+VignetteBuilder: knitr
+Depends:
+    R (>= 4.3.0)
+Imports:
+    Rcpp (>= 0.12.12),
+    utils
+LinkingTo: Rcpp
+Suggests:
+    jsonlite (>= 1.0),
+    testthat,
+    knitr,
+    rmarkdown
+Roxygen: list(load = "installed", markdown = TRUE)
+Language: en-US
+Encoding: UTF-8
+Config/roxygen2/version: 8.1.1

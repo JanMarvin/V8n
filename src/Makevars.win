@@ -1,0 +1,22 @@
+CXX_STD = CXX20
+RWINLIB = ../.deps/libv8
+PKG_CPPFLAGS = -I$(RWINLIB)/include -DV8_COMPRESS_POINTERS
+PKG_LIBS = \
+	-L$(RWINLIB)/lib \
+	-lv8_monolith \
+	-lws2_32 -lwinmm -ldbghelp -lshlwapi -lssp -lz -lpthread
+
+all: $(SHLIB) cleanup
+
+# Needed for parallel make
+$(OBJECTS): | $(RWINLIB)
+
+$(RWINLIB):
+	@"${R_HOME}/bin${R_ARCH_BIN}/Rscript.exe" "../tools/winlibs.R"
+
+cleanup: $(SHLIB)
+	@rm -Rf $(RWINLIB)
+
+$(OBJECTS): v8n.h V8n_types.h
+convert.o: convert_js.h
+web.o: web_js.h

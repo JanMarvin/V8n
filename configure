@@ -1,0 +1,164 @@
+#!/bin/sh
+# Finds libv8 (version 11.3 or newer), or downloads a static build of it.
+# To use a custom libv8 set V8_PKG_CFLAGS and V8_PKG_LIBS.
+PKG_DEB_NAME="libnode-dev"
+PKG_RPM_NAME="v8-devel"
+PKG_BREW_NAME="v8"
+PKG_LIBS="-lv8 -lv8_libplatform"
+PKG_CFLAGS="-I/usr/include/v8"
+
+if [ "$V8_PKG_LIBS" ]; then
+  PKG_LIBS="$V8_PKG_LIBS"
+  PKG_CFLAGS="$V8_PKG_CFLAGS"
+  DISABLE_STATIC_LIBV8=1
+fi
+
+UNAME=`uname`
+UARCH=`uname -m`
+
+# Platforms where the static libv8 is the default
+if [ "$UNAME" = "Darwin" ]; then
+  HAVE_STATIC=1
+elif test -f "/etc/redhat-release" && ! grep -Fq Fedora "/etc/redhat-release"; then
+  HAVE_STATIC=1
+elif test -f "/etc/os-release" && grep -Fq Ubuntu "/etc/os-release"; then
+  HAVE_STATIC=1
+elif test -f "/etc/os-release" && grep -Fq suse "/etc/os-release"; then
+  HAVE_STATIC=1
+elif test -f "/etc/os-release" && grep -Fq alpine "/etc/os-release"; then
+  HAVE_STATIC=1
+elif test -f "/etc/os-release" && grep -Fq amzn "/etc/os-release"; then
+  HAVE_STATIC=1
+fi
+
+if [ -z "$DISABLE_STATIC_LIBV8" ] && { [ "$HAVE_STATIC" ] || [ "$CI" ]; }; then
+  case "$UARCH" in
+    x86_64 | arm64 | aarch64 | ppc64le) DOWNLOAD_STATIC_LIBV8=1 ;;
+  esac
+fi
+
+# libv8 12.7 and up requires C++20, older versions C++17
+CXX20=`${R_HOME}/bin/R CMD config CXX20` || unset CXX20
+if [ "$CXX20" ]; then
+  echo "Found C++20 compiler: $CXX20"
+  CXX_STD=CXX20
+  CXX="$CXX20 `${R_HOME}/bin/R CMD config CXX20STD`"
+  CXXFLAGS=`${R_HOME}/bin/R CMD config CXX20FLAGS`
+else
+  CXX_STD=CXX17
+  CXX="`${R_HOME}/bin/R CMD config CXX17` `${R_HOME}/bin/R CMD config CXX17STD`"
+  CXXFLAGS=`${R_HOME}/bin/R CMD config CXX17FLAGS`
+fi
+CPPFLAGS=`${R_HOME}/bin/R CMD config CPPFLAGS`
+LDFLAGS=`${R_HOME}/bin/R CMD config LDFLAGS`
+CXXCPP="$CXX -E"
+
+if [ "$INCLUDE_DIR" ] || [ "$LIB_DIR" ]; then
+  echo "Found INCLUDE_DIR and/or LIB_DIR!"
+  PKG_CFLAGS="-I$INCLUDE_DIR $PKG_CFLAGS"
+  PKG_LIBS="-L$LIB_DIR $PKG_LIBS"
+elif [ "$UNAME" = "Darwin" ]; then
+  if [ `command -v brew` ] && [ -z "$DOWNLOAD_STATIC_LIBV8" ]; then
+    BREWDIR=`brew --prefix`
+    V8HOME="$BREWDIR/opt/$PKG_BREW_NAME"
+    PKG_CFLAGS="-I${V8HOME}/include -I${V8HOME}/libexec/include"
+    PKG_LIBS="-L${V8HOME}/libexec $PKG_LIBS"
+  else
+    curl -sfL "https://autobrew.github.io/scripts/$PKG_BREW_NAME" > autobrew
+    # The autobrew script writes src/Makevars and exits, so it runs in a
+    # subshell to add the linker flag explained below
+    rm -f src/Makevars
+    (
+      . ./autobrew
+    )
+    if [ -f src/Makevars ]; then
+      sed -e "s|^PKG_LIBS = .*|& -Wl,-exported_symbol,_R_init_V8n|" src/Makevars > src/Makevars.tmp
+      mv src/Makevars.tmp src/Makevars
+      exit 0
+    fi
+  fi
+elif [ "$DOWNLOAD_STATIC_LIBV8" ]; then
+  . ./tools/get-v8-linux.sh || true
+fi
+
+echo "Using CXXCPP=$CXXCPP"
+echo "Using PKG_CFLAGS=$PKG_CFLAGS"
+echo "Using PKG_LIBS=$PKG_LIBS"
+
+# Test for libv8 and its version
+printf '#include <v8.h>\n#if V8_MAJOR_VERSION * 100 + V8_MINOR_VERSION < 1103\n#error "V8n requires libv8 11.3 or newer"\n#endif\n' | \
+  ${CXXCPP} ${PKG_CFLAGS} ${CPPFLAGS} ${CXXFLAGS} -xc++ - >/dev/null 2>configure.log
+
+if [ $? -ne 0 ]; then
+  echo "-----------------------------[ ANTICONF ]-------------------------------"
+  echo "Configuration failed to find libv8 11.3 or newer. Try installing:"
+  echo " * deb: $PKG_DEB_NAME (Debian 13, Ubuntu 25.04 or newer)"
+  echo " * rpm: $PKG_RPM_NAME (Fedora)"
+  echo " * brew: $PKG_BREW_NAME (macOS)"
+  echo "Alternatively, on Linux or macOS you can set the environment variable"
+  echo "    DOWNLOAD_STATIC_LIBV8=1"
+  echo "to download a static build of libv8 (recommended)."
+  echo "To use a custom libv8, set V8_PKG_CFLAGS and V8_PKG_LIBS."
+  echo "---------------------------[ ERROR MESSAGE ]----------------------------"
+  cat configure.log
+  echo "------------------------------------------------------------------------"
+  exit 1
+fi
+
+# The API of V8 passes C++ standard library types, so libv8 must use the same
+# C++ standard library as R (libstdc++ or libc++). The compiler that built it
+# does not matter. A mismatch shows up as undefined symbols here.
+echo "Running link test..."
+${CXX} ${PKG_CFLAGS} ${CPPFLAGS} ${CXXFLAGS} tools/test.cpp -o pctest1 ${PKG_LIBS} ${LDFLAGS} -ldl -pthread 2>> configure.log
+if [ $? -ne 0 ]; then
+  echo "-----------------------------[ ANTICONF ]-------------------------------"
+  echo "Found libv8 but failed to link a test program against it. Usually libv8"
+  echo "was built with a different C++ standard library than R uses, e.g. with"
+  echo "the bundled libc++ of V8 (use_custom_libcxx=true) instead of libstdc++."
+  echo "---------------------------[ ERROR MESSAGE ]----------------------------"
+  grep -E "undefined|error" configure.log | tail -n 20
+  echo "------------------------------------------------------------------------"
+  exit 1
+fi
+
+# libv8 must be compiled with the same pointer compression and sandbox
+# settings as the package, which V8 checks at startup
+echo "Running feature test for pointer compression..."
+{ ./pctest1; } 2>> configure.log
+if [ $? -eq 0 ]; then
+  echo "Pointer compression not needed"
+else
+  echo "Enabling pointer compression"
+  PKG_CFLAGS="$PKG_CFLAGS -DV8_COMPRESS_POINTERS"
+  echo "Running feature test for sandbox..."
+  ${CXX} ${CPPFLAGS} ${PKG_CFLAGS} ${CXXFLAGS} tools/test.cpp -o pctest2 ${LDFLAGS} ${PKG_LIBS} -ldl -pthread
+  { ./pctest2; } 2> configure.log
+  if [ $? -ne 0 ]; then
+    if grep -Fq "sandbox" "configure.log"; then
+      echo "Enabling sandbox"
+      PKG_CFLAGS="$PKG_CFLAGS -DV8_ENABLE_SANDBOX"
+    else
+      grep 'mismatch' configure.log && exit 1
+    fi
+  else
+    echo "Sandbox not enabled"
+  fi
+fi
+rm -Rf pctest*
+
+# Only the init function of the package is exported. Otherwise the symbols of
+# a static libv8 are visible to the dynamic linker, which may then bind them
+# across packages, e.g. to the libv8 inside the V8 package when both are
+# loaded. This fails when the two libv8 versions differ.
+if [ "$UNAME" = "Darwin" ]; then
+  PKG_LIBS="$PKG_LIBS -Wl,-exported_symbol,_R_init_V8n"
+else
+  ${CXX} ${PKG_CFLAGS} ${CPPFLAGS} ${CXXFLAGS} tools/test.cpp -o pctest3 ${PKG_LIBS} ${LDFLAGS} -Wl,--exclude-libs,ALL -ldl -pthread 2>> configure.log
+  if [ $? -eq 0 ]; then
+    PKG_LIBS="$PKG_LIBS -Wl,--exclude-libs,ALL"
+  fi
+  rm -f pctest3
+fi
+
+sed -e "s|@cflags@|$PKG_CFLAGS|" -e "s|@libs@|$PKG_LIBS|" -e "s|CXX20|$CXX_STD|" src/Makevars.in > src/Makevars
+exit 0

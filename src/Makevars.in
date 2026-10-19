@@ -1,0 +1,13 @@
+CXX_STD = CXX20
+PKG_CPPFLAGS = @cflags@
+PKG_CXXFLAGS = $(CXX_VISIBILITY)
+PKG_LIBS = @libs@
+
+all: $(SHLIB) cleanup
+
+cleanup: $(SHLIB)
+	@rm -Rf ../.deps
+
+$(OBJECTS): v8n.h V8n_types.h
+convert.o: convert_js.h
+web.o: web_js.h

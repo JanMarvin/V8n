@@ -1,0 +1,12 @@
+.Rproj.user
+.Rhistory
+.RData
+.DS_Store
+src/*.o
+src/*.so
+src/*.dll
+src/Makevars
+configure.log
+autobrew
+.deps
+.positai
