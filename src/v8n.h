@@ -48,6 +48,7 @@ double web_clock();
 /* pin.cpp */
 void pin_library();
 std::string library_path(const void* address);
+uintptr_t stack_low_end();
 extern bool icu_data_missing;
 uint64_t physical_memory();
 

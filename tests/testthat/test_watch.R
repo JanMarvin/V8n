@@ -49,3 +49,15 @@ test_that("a string above the maximum length gives an error", {
   rm(x)
   expect_identical(ctx$eval("1 + 1"), "2")
 })
+
+test_that("runaway recursion gives an error instead of a crash", {
+  ctx <- v8()
+  expect_error(ctx$eval("function f() { return f() + 1; } f()"),
+               "Maximum call stack size exceeded")
+  src <- "function g(n) {
+    return n === 0 ? console.r.call('sum', [1, 2, 3]) : g(n - 1);
+  }
+  g(5000)"
+  expect_identical(ctx$eval(src), "6")
+  expect_identical(ctx$eval("1 + 1"), "2")
+})

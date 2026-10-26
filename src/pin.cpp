@@ -3,7 +3,9 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <pthread.h>
 #endif
+#include <cstdint>
 #include <string>
 
 static const char anchor = 0;
@@ -42,5 +44,40 @@ std::string library_path(const void* address){
   if(dladdr(address, &info) == 0 || info.dli_fname == nullptr)
     return std::string();
   return std::string(info.dli_fname);
+#endif
+}
+
+/* The lowest address of the stack of the current thread as the system
+ * reports it, or 0 if it does not. Stacks grow downwards on the platforms
+ * of R. V8 finds the stack in the same ways. */
+uintptr_t stack_low_end(){
+#ifdef _WIN32
+  /* The allocation of the stack, which contains this variable, begins at
+   * its lowest reserved address */
+  const char on_stack = 0;
+  MEMORY_BASIC_INFORMATION memory;
+  if(VirtualQuery(&on_stack, &memory, sizeof(memory)) == 0)
+    return 0;
+  return reinterpret_cast<uintptr_t>(memory.AllocationBase);
+#elif defined(__APPLE__)
+  pthread_t self = pthread_self();
+  uintptr_t top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
+  size_t size = pthread_get_stacksize_np(self);
+  if(top == 0 || size == 0 || size >= top)
+    return 0;
+  return top - size;
+#elif defined(__linux__)
+  pthread_attr_t attr;
+  void* address = nullptr;
+  size_t size = 0;
+  if(pthread_getattr_np(pthread_self(), &attr) != 0)
+    return 0;
+  int error = pthread_attr_getstack(&attr, &address, &size);
+  pthread_attr_destroy(&attr);
+  if(error != 0)
+    return 0;
+  return reinterpret_cast<uintptr_t>(address);
+#else
+  return 0;
 #endif
 }

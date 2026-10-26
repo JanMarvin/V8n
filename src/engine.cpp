@@ -194,15 +194,28 @@ static v8::Isolate* create_isolate(){
   watch_install(out);
   out->AddMessageListener(message_callback);
   out->SetFatalErrorHandler(fatal_callback);
+  /* JavaScript may use the stack below this point down to a reserve at its
+   * end, which is left to R and C++; V8 enforces that with a RangeError. The
+   * end of the stack is asked from the system, as V8 does it. Sanitizers use
+   * larger stack frames, so they keep a larger reserve. With an unlimited
+   * stack the limit is 64MB below this point, and if the system does not
+   * tell, 2MB. A limit of 1, to disable it, does not work with newer V8,
+   * which derives the size of the stack from it (see jeroen/V8#207). */
+  const uintptr_t position = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  const uintptr_t low = stack_low_end();
+  const uintptr_t max_size = static_cast<uintptr_t>(64) * 1024 * 1024;
+  uintptr_t stack_limit = position - static_cast<uintptr_t>(2000) * 1024;
+  if(low != 0 && low < position){
+    const uintptr_t room = position - low;
 #ifdef __SANITIZE_ADDRESS__
-  /* Sanitizers use a different stack, so the limit is effectively disabled */
-  out->SetStackLimit(1);
+    stack_limit = low + room / 4;
 #else
-  /* Leave about 2MB of the R stack to V8, some distributions default to less */
-  const uintptr_t stack_size = 2000 * 1024;
-  uintptr_t stack_position = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
-  out->SetStackLimit(stack_position - stack_size);
+    stack_limit = low + room / 8;
 #endif
+    if(position - stack_limit > max_size)
+      stack_limit = position - max_size;
+  }
+  out->SetStackLimit(stack_limit);
   out->SetHostImportModuleDynamicallyCallback(import_module);
   return out;
 }
