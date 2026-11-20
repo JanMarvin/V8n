@@ -165,7 +165,12 @@ static void native_random_fill(const v8::FunctionCallbackInfo<v8::Value>& args) 
       for(size_t k = 0; k < 4 && i + k < n; k++)
         bytes[i + k] = static_cast<uint8_t>(r >> (8 * k));
     }
-    uint8_t* data = static_cast<uint8_t*>(array->Buffer()->Data()) + array->ByteOffset();
+#if V8_MAJOR_VERSION >= 16
+    uint8_t* base = static_cast<uint8_t*>(array->GetBuffer()->Data());
+#else
+    uint8_t* base = static_cast<uint8_t*>(array->Buffer()->Data());
+#endif
+    uint8_t* data = base + array->ByteOffset();
     if(n > 0)
       std::memcpy(data, bytes.data(), n);
   } catch(...){
