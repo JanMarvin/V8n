@@ -99,13 +99,13 @@
 #'
 #' @references A Mapping Between JSON Data and R Objects (Ooms, 2014):
 #' <https://arxiv.org/abs/1403.2805>
-#' @export v8 new_context
+#' @export
 #' @param global character vector with the name(s) of the global object. Use
 #' `NULL` for no name.
 #' @param console expose the `console` API (`console.log`, `console.warn`,
 #' `console.error` and `console.r`).
 #' @param ... ignored parameters for past or future versions.
-#' @aliases V8n v8 new_context
+#' @aliases V8n v8
 #' @rdname V8n
 #' @name V8n
 #' @import Rcpp
@@ -253,6 +253,8 @@ v8 <- function(global = "global", console = TRUE, ...) {
 }
 
 # The name used by early versions of V8
+#' @rdname V8n
+#' @export
 new_context <- v8
 
 join <- function(str) {

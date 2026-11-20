@@ -9,6 +9,8 @@
 \usage{
 v8(global = "global", console = TRUE, ...)
 
+new_context(global = "global", console = TRUE, ...)
+
 engine_info()
 }
 \arguments{
