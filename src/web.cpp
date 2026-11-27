@@ -117,7 +117,7 @@ static void native_queue_microtask(const v8::FunctionCallbackInfo<v8::Value>& ar
     throw_js("The callback must be a function.");
     return;
   }
-  isolate->EnqueueMicrotask(args[0].As<v8::Function>());
+  isolate->GetCurrentContext()->GetMicrotaskQueue()->EnqueueMicrotask(isolate, args[0].As<v8::Function>());
 }
 
 /* structuredClone() with V8's own serializer, as browsers use it. Without a
